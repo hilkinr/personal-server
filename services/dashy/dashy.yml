@@ -1,0 +1,100 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashy
+  labels:
+    app: dashy
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: dashy
+  template:
+    metadata:
+      labels:
+        app: dashy
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - toybox
+      containers:
+      - name: dashy
+        image: docker.io/lissy93/dashy:2.1.1
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: HOST
+          value: "::"
+        - name: PORT
+          value: "8080"
+        - name: NODE_ENV
+          value: "PRODUCTION"
+        ports:
+          - containerPort: 8080
+            name: http
+            protocol: TCP
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: dashy-config
+          mountPath: /app/public/conf.yml
+          subPath: conf.yml
+      volumes:
+        - name: dashy-config
+          configMap:
+            name: dashy-config
+      tolerations:
+      - key: "kubernetes.io/hostname"
+        operator: "Equal"
+        value: "toybox"
+        effect: "NoSchedule"
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashy
+spec:
+  selector:
+    app: dashy
+  ports:
+    - protocol: TCP
+      port: 8080
+  clusterIP: None
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dashy-ingress
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: "nginx"
+  rules:
+  - host: board.erebe.eu
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: dashy
+            port:
+              number: 8080

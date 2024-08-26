@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud
+  labels:
+    app: nextcloud
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate 
+  selector:
+    matchLabels:
+      app: nextcloud
+  template:
+    metadata:
+      labels:
+        app: nextcloud
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+      - key: "kubernetes.io/hostname"
+        operator: "Equal"
+        value: "minio"
+      securityContext:
+        fsGroup: 65534
+        fsGroupChangePolicy: "OnRootMismatch"
+      containers:
+      - name: nextcloud
+        image: linuxserver/nextcloud:27.0.2
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8083
+        volumeMounts:
+        - name: nginx-siteconfig
+          mountPath: /defaults/nginx/site-confs/
+        - name: data
+          subPath: config
+          mountPath: /config
+        - name: data
+          subPath: data
+          mountPath: /data
+        - name: preview
+          mountPath: /data/appdata_ocxf7jgp27m7/preview
+      volumes:
+      - name: nginx-siteconfig
+        configMap:
+          name: nextcloud-nginx-siteconfig
+      - name: preview
+        hostPath:
+          path: /opt/nextcloud/preview
+          type: Directory
+      - name: data
+        persistentVolumeClaim:
+          claimName: nextcloud-pv-claim
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nextcloud-pv-claim
+spec:
+  storageClassName: nfs-nvme
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nextcloud
+spec:
+  selector:
+    app: nextcloud
+  ports:
+    - name: http
+      port: 8083
+      protocol: TCP
+  type: ClusterIP
+  clusterIP: None
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nextcloud-ingress
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10G"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: "nginx"
+  rules:
+  - host: cloud.erebe.eu
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nextcloud
+            port:
+              name: http
