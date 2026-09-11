@@ -38,7 +38,10 @@
               atime: 'off'
               # Already the ZFS default, but set locally on the pool - listed
               # so the declaration matches the host and the first run is green.
-              xattr: 'on'
+              xattr: 'sa'
+              compression: 'lz4'
+              dnodesize: auto
+              recordsize: 128K
       ansible.builtin.import_tasks: ../common/tasks/zfs-datasets.yml
 
     # Snapshots, and the login proxmox pulls them with - the shared task does

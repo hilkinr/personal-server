@@ -39,10 +39,13 @@
           - name: nvme
             properties:
               atime: 'off'
+              xattr: 'sa'
+              compression: 'lz4'
               # Lets a dnode grow past the 512b `legacy` default so sa xattrs
               # and long filenames fit inline. Applies only to newly written
               # files, so it has to be set before the data lands.
               dnodesize: auto
+              recordsize: 128K
               sharenfs: 'rw=*,no_root_squash,no_subtree_check'
           # PREREQUISITE for services/csi/zfs-nfs-nvme-values.yaml, not tidiness.
           # DeleteVolume unshares with `zfs inherit sharenfs`, so without a local
@@ -58,7 +61,10 @@
           - name: backup
             properties:
               atime: 'off'
-              compression: 'on'
+              xattr: 'sa'
+              dnodesize: auto
+              compression: 'zstd-1'
+              recordsize: 128K
           - name: backup/data
             properties:
               sharenfs: 'rw=*,no_root_squash,no_subtree_check'

@@ -96,9 +96,6 @@ csi:
 	set -euo pipefail
 	helm repo add democratic-csi https://democratic-csi.github.io/charts/
 	helm repo update democratic-csi
-	helm upgrade --install zfs-iscsi democratic-csi/democratic-csi \
-	    --namespace democratic-csi --create-namespace \
-	    --values csi/zfs-iscsi-values.yaml
 	helm upgrade --install local-hostpath democratic-csi/democratic-csi \
 	    --namespace democratic-csi --create-namespace \
 	    --values csi/local-hostpath-values.yaml
