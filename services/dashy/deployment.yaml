@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashy
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels: {}
+  template:
+    metadata: {}
+    spec:
+#      hostNetwork: true
+#      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - toybox
+      containers:
+      - name: dashy
+        image: docker.io/lissy93/dashy:3.x
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: HOST
+          value: "::"
+        - name: PORT
+          value: "8080"
+        - name: NODE_ENV
+          value: "production"
+        ports:
+          - containerPort: 8080
+            name: http
+            protocol: TCP
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: dashy-config
+          mountPath: /app/user-data/conf.yml
+          subPath: conf.yml
+      volumes:
+        - name: dashy-config
+          configMap:
+            name: dashy-config
+      tolerations:
+      - key: "kubernetes.io/hostname"
+        operator: "Equal"
+        value: "toybox"
+        effect: "NoSchedule"
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"

@@ -1,0 +1,90 @@
+---
+# sanoid: scheduled ZFS snapshots, plus the login proxmox pulls them with.
+# Requires play var: node_dir
+# Optional play var: sanoid_pulled_remotely (default true) - false on a host
+# nothing fetches snapshots from over ssh.
+#
+# The syncoid units themselves belong to a *pair* of hosts, so they live in
+# nodes/proxmox/, which pulls from both nvme and scw.
+
+- name: Install sanoid
+  # lzop and mbuffer are syncoid's default compressor and buffer; it probes for
+  # them on each end and silently drops whichever is missing.
+  ansible.builtin.apt:
+    name:
+      - sanoid
+      - lzop
+      - mbuffer
+    update_cache: true
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Ensure /etc/sanoid exists
+  ansible.builtin.file:
+    path: /etc/sanoid
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Upload sanoid.conf
+  # Per node, not templated: sanoid.conf cannot include another file, so the
+  # shared template_* blocks are repeated in each node's copy.
+  #
+  # Must land before the timer below - sanoid.service has
+  # ConditionFileNotEmpty=/etc/sanoid/sanoid.conf, so a run with no config is
+  # skipped rather than failed.
+  ansible.builtin.copy:
+    src: "{{ node_dir }}/sanoid/sanoid.conf"
+    dest: /etc/sanoid/sanoid.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Enable sanoid.timer
+  # The packaged timer is *:0/15 - that is how sanoid catches every period
+  # boundary, not an hourly cadence. `state: started` arms it now; `enabled`
+  # alone would wait for the next boot.
+  ansible.builtin.systemd:
+    name: sanoid.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  # Under --check the install above did not happen, so on a fresh host there is
+  # no timer to find. Same reason zfs.yml skips modprobe.
+  when: not ansible_check_mode
+
+- name: Load the syncoid keypair from sops
+  # NOT `name: ansible_facts` as wireguard.yml uses - that name exists there
+  # only so the wg *.j2 templates can reach the payload (inject_facts_as_vars
+  # is off). Copying it here shadowed the real facts for the rest of the play
+  # and broke networkd.yml's `ansible_facts.services` six tasks later.
+  community.sops.load_vars:
+    file: "{{ inventory_dir }}/../secrets/syncoid.yml"
+    name: syncoid_secrets
+    expressions: ignore
+
+- name: Authorize proxmox's syncoid key for the ansible ssh user
+  # ansible_user is the one login already proven to work and to reach zfs (as
+  # root, or through sudo), so no second account or zfs delegation is needed.
+  # The cost: on scw that is erebe's NOPASSWD sudo, making this key
+  # admin-equivalent there.
+  #
+  # `restrict` drops ptys, agent, X11 and port forwarding; command execution and
+  # syncoid's multiplexed sessions still work. `from=` pins the key to proxmox's
+  # wg address, which nothing else can present on wg0.
+  ansible.posix.authorized_key:
+    user: "{{ ansible_user }}"
+    key: "{{ syncoid_secrets.SYNCOID_PUBLIC_KEY }}"
+    key_options: 'restrict,from="10.200.0.7"'
+    state: present
+    # Default is follow: false, which would *replace* the path - and on proxmox
+    # that path is a symlink into pmxcfs, so sshd would read a plain file PVE
+    # never writes again.
+    follow: true
+    # exclusive: true would drop every key cloud-init, `just install` and PVE
+    # put here.
+    exclusive: false
+  # Nothing pulls from the puller - and on proxmox the write would land in
+  # pmxcfs, which forces root:www-data and then fails the play on chown.
+  when: sanoid_pulled_remotely | default(true)

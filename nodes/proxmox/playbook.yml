@@ -1,0 +1,228 @@
+---
+- name: Configure proxmox node
+  hosts: proxmox
+  # connects as root already (per inventory) — no sudo needed
+  become: false
+  vars:
+    node_dir: "{{ inventory_dir }}/proxmox"
+    # The puller, not a source: no inbound syncoid key here. On this host it
+    # would also land in pmxcfs and fail the play.
+    sanoid_pulled_remotely: false
+
+  tasks:
+    - name: iSCSI target tooling (targetcli-fb)
+      tags: [package, never]
+      ansible.builtin.apt:
+        name: targetcli-fb
+        update_cache: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: ZFS datasets and properties
+      tags: [zfs, never]
+      vars:
+        # Only what is set *locally* on the host today, so the first run is a
+        # no-op. A property left out is left inherited - this never runs
+        # `zfs inherit`, so deleting a line here does not unset anything.
+        #
+        # Numeric values must be byte counts, not `200G`: the module compares
+        # against `zfs get -p`, so a human-readable size never matches and the
+        # task is reported changed on every run.
+        #
+        # `off` and `on` must stay quoted - YAML reads them as booleans, and the
+        # module would run `zfs set sharenfs=False`.
+        #
+        # The syncoid targets (backup/nvme-backup, backup/scw-backup) are
+        # deliberately absent: syncoid creates them on the first send, and a
+        # pre-created empty dataset is not a receivable one.
+        zfs_datasets:
+          - name: nvme
+            properties:
+              atime: 'off'
+              xattr: 'sa'
+              compression: 'lz4'
+              # Lets a dnode grow past the 512b `legacy` default so sa xattrs
+              # and long filenames fit inline. Applies only to newly written
+              # files, so it has to be set before the data lands.
+              dnodesize: auto
+              recordsize: 128K
+              sharenfs: 'rw=*,no_root_squash,no_subtree_check'
+          # PREREQUISITE for services/csi/zfs-nfs-nvme-values.yaml, not tidiness.
+          # DeleteVolume unshares with `zfs inherit sharenfs`, so without a local
+          # `off` here the volume keeps the pool root's `rw=*` export and the
+          # destroy fails forever with `pool or dataset is busy`.
+          - name: nvme/k8s
+            properties:
+              sharenfs: 'off'
+          # datasetParentName. democratic-csi creates the volumes beneath it but
+          # not the parent itself.
+          - name: nvme/k8s/v
+
+          - name: backup
+            properties:
+              atime: 'off'
+              xattr: 'sa'
+              dnodesize: auto
+              compression: 'zstd-1'
+              recordsize: 128K
+          - name: backup/data
+            properties:
+              sharenfs: 'rw=*,no_root_squash,no_subtree_check'
+          # Same prerequisite as nvme/k8s, for the hdd driver.
+          - name: backup/data/k8s
+            properties:
+              sharenfs: 'off'
+          - name: backup/data/k8s/v
+      ansible.builtin.import_tasks: ../common/tasks/zfs-datasets.yml
+
+    - name: Wireguard
+      tags: [wireguard, never]
+      ansible.builtin.import_tasks: ../common/tasks/wireguard.yml
+
+    - name: Sanoid / Syncoid ZFS snapshots and backup
+      tags: [sanoid, never]
+      block:
+        - name: Snapshot policy
+          ansible.builtin.import_tasks: ../common/tasks/sanoid.yml
+
+        - name: Upload csi-snapshot-unflag post-snapshot hook
+          ansible.builtin.copy:
+            src: "{{ node_dir }}/sanoid/csi-snapshot-unflag"
+            dest: /usr/local/bin/csi-snapshot-unflag
+            owner: root
+            group: root
+            mode: '0755'
+
+        # The private half. In sops rather than generated here so each source
+        # node can authorize the public half without proxmox being reachable.
+        # Loaded into syncoid_secrets by the shared task above.
+        - name: Ensure /etc/syncoid exists
+          ansible.builtin.file:
+            path: /etc/syncoid
+            state: directory
+            owner: root
+            group: root
+            mode: '0700'
+
+        - name: Install the key proxmox authenticates to scw with
+          # Block scalar + trim: openssh rejects a key with no trailing
+          # newline, or with a blank line at the end.
+          ansible.builtin.copy:
+            content: |
+              {{ syncoid_secrets.SYNCOID_PRIVATE_KEY | trim }}
+            dest: /etc/syncoid/id_scw
+            owner: root
+            group: root
+            mode: '0600'
+          no_log: true
+
+        - name: Upload the syncoid units
+          # One pair per job: nvme -> backup locally, scw:zdata -> backup over wg.
+          ansible.builtin.copy:
+            src: "{{ node_dir }}/sanoid/{{ item }}"
+            dest: "/etc/systemd/system/{{ item }}"
+            owner: root
+            group: root
+            mode: '0644'
+          loop:
+            - syncoid-backup.service
+            - syncoid-backup.timer
+            - syncoid-scw.service
+            - syncoid-scw.timer
+          notify: daemon-reload
+
+        - name: Enable the syncoid timers
+          # daemon_reload here, not via the handler: that runs at the end of the
+          # play, and systemd must read the units before it can enable them.
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            enabled: true
+            state: started
+            daemon_reload: true
+          loop:
+            - syncoid-backup.timer
+            - syncoid-scw.timer
+          # Under --check the units were never written, so there is no timer
+          # to find.
+          when: not ansible_check_mode
+
+    - name: Restic offsite backups
+      tags: [restic, never]
+      vars:
+        # Instance name -> what it backs up. The name is the systemd instance,
+        # the env file basename, the restic tag, and the secrets key prefix.
+        restic_jobs:
+          - name: nextcloud
+            source: /backup/data/default-nextcloud-hdd-pv-claim-pvc-12f99576-32ac-4ea8-b690-8b4b99c3c03a
+          - name: nvme-backup
+            source: /backup/nvme-backup
+      block:
+        - name: Load the restic credentials from sops
+          # Own name, not ansible_facts: that name is reserved here for the
+          # wireguard templates, and reusing it shadows every gathered fact.
+          community.sops.load_vars:
+            file: "{{ inventory_dir }}/../secrets/restic.yml"
+            name: restic_secrets
+            expressions: ignore
+
+        - name: Ensure /etc/restic exists
+          ansible.builtin.file:
+            path: /etc/restic
+            state: directory
+            owner: root
+            group: root
+            mode: '0700'
+
+        - name: Install the per-instance restic environment files
+          # One repository per job, each with its own password: a leaked key for
+          # one repository does not open the other. sops holds the only other
+          # copy of both - lose it and that repository is unreadable forever.
+          ansible.builtin.copy:
+            content: |
+              RESTIC_REPOSITORY={{ restic_secrets['RESTIC_' ~ (item.name | upper | replace('-', '_')) ~ '_REPOSITORY'] }}
+              RESTIC_PASSWORD={{ restic_secrets['RESTIC_' ~ (item.name | upper | replace('-', '_')) ~ '_PASSWORD'] }}
+              RESTIC_SOURCE={{ item.source }}
+              AWS_ACCESS_KEY_ID={{ restic_secrets.AWS_ACCESS_KEY_ID }}
+              AWS_SECRET_ACCESS_KEY={{ restic_secrets.AWS_SECRET_ACCESS_KEY }}
+              AWS_DEFAULT_REGION={{ restic_secrets.AWS_DEFAULT_REGION }}
+            dest: "/etc/restic/{{ item.name }}.env"
+            owner: root
+            group: root
+            mode: '0600'
+          loop: "{{ restic_jobs }}"
+          loop_control:
+            label: "{{ item.name }}"
+          no_log: true
+
+        - name: Upload the restic units
+          ansible.builtin.copy:
+            src: "{{ node_dir }}/restic/{{ item }}"
+            dest: "/etc/systemd/system/{{ item }}"
+            owner: root
+            group: root
+            mode: '0644'
+          loop:
+            - restic@.service
+            - restic@nextcloud.timer
+            - restic@nvme-backup.timer
+          notify: daemon-reload
+
+        - name: Enable the restic timers
+          # daemon_reload here, not via the handler: that runs at the end of the
+          # play, and systemd must read the units before it can enable them.
+          ansible.builtin.systemd:
+            name: "restic@{{ item.name }}.timer"
+            enabled: true
+            state: started
+            daemon_reload: true
+          loop: "{{ restic_jobs }}"
+          loop_control:
+            label: "{{ item.name }}"
+          # Under --check the units were never written, so there is no timer
+          # to find.
+          when: not ansible_check_mode
+
+  handlers:
+    - name: daemon-reload
+      ansible.builtin.systemd:
+        daemon_reload: true

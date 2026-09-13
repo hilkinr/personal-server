@@ -1,13 +1,24 @@
+# Explicitly empty, not absent: the cilium CLI reuses the previous release's
+# values, so deleting this key leaves the old `eth0,wg0` in cilium-config. That
+# value was a fossil - only server and dns have an eth0, so master, toybox and
+# scw ended up managing wg0 alone and NodePort/externalIP traffic arriving on
+# their real WAN device (ens18, enp65s0f0) was never load-balanced. Empty means
+# auto-detect: each node's default-route device plus the one holding its node IP.
+devices: ""
 ipv6:
   enabled: true
 bpf:
-  masquerade: true
+  masquerade: false
+  lbExternalClusterIP: false
+kubeProxyReplacement: true
+
+l7Proxy: false
+envoy:
+  enabled: false
 
 k8sServiceHost: "fd00:cafe::3"
 k8sServicePort: "6443"
 
-containerRuntime:
-  integration: "containerd"
 global:
   containerRuntime:
     socketPath: "/var/run/k3s/containerd/containerd.sock"
@@ -27,6 +38,7 @@ affinity:
           values:
           - raspberry
 operator:
+  replicas: 1
   affinity:
     nodeAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
@@ -34,3 +46,29 @@ operator:
         - matchExpressions:
           - key: node-role.kubernetes.io/master
             operator: Exists
+
+hubble:
+  enabled: false
+  dashboards:
+    enabled: false
+  ui:
+    enabled: false
+    tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+  relay:
+    enabled: false
+    tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+  metrics:
+    enabled:
+      - dns
+      - drop
+      - tcp
+      - flow
+      - port-distribution
+      - icmp
+      - httpV2:exemplars=true;labelsContext=source_ip,source_namespace,source_workload,destination_ip,destination_namespace,destination_workload,traffic_direction

@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blog
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {}
+  template:
+    metadata: {}
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: blog
+        image: ghcr.io/erebe/blog:latest
+        imagePullPolicy: Always
+        env:
+        - name: HTTP_LISTEN
+          value: "[::]:8087"
+        ports:
+        - containerPort: 8087
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8087
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8087

@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {}
+  template:
+    metadata: {}
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        fsGroup: 65534
+        fsGroupChangePolicy: "OnRootMismatch"
+      containers:
+      - name: nextcloud
+        image: linuxserver/nextcloud:31.0.8
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8083
+        volumeMounts:
+        - name: nginx-siteconfig
+          mountPath: /defaults/nginx/site-confs/
+        - name: data-nvme
+          subPath: config
+          mountPath: /config
+        - name: data-nvme
+          subPath: data
+          mountPath: /data
+        - name: data-hdd
+          subPath: photos
+          mountPath: /data/cecile/files/photos
+        - name: preview
+          mountPath: /data/appdata_ocxf7jgp27m7/preview
+        # A single-file subPath mount nested inside the /config PVC: it adds
+        # this one file to /config/php without shadowing php-local.ini or
+        # www2.conf, which the image seeds there and expects to keep.
+        - name: php-config
+          mountPath: /config/php/zz-timezone.ini
+          subPath: zz-timezone.ini
+      volumes:
+      - name: nginx-siteconfig
+        configMap:
+          name: nextcloud-nginx-siteconfig
+      - name: php-config
+        configMap:
+          name: nextcloud-php-config
+      - name: preview
+        hostPath:
+          path: /opt/nextcloud/preview
+          type: Directory
+      - name: data-nvme
+        persistentVolumeClaim:
+          claimName: nextcloud-pv-claim
+      - name: data-hdd
+        persistentVolumeClaim:
+          claimName: nextcloud-hdd-pv-claim
