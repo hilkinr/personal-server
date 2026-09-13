@@ -1,8 +1,10 @@
+use crate::geoip::GeoIp;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -123,14 +125,33 @@ fn downstream_user_of<B>(request: &Request<B>) -> Option<&str> {
     if user.is_empty() { None } else { Some(user) }
 }
 
-/// Span of a request, adding the site and the user doing the request to the default fields
+/// Page the client followed a link from. Absent for a direct visit, and for most cross-site ones:
+/// browsers default to strict-origin-when-cross-origin, and a site can drop it with Referrer-Policy.
+fn referer_of<B>(request: &Request<B>) -> Option<&str> {
+    let referer = request.headers().get(header::REFERER)?.to_str().ok()?;
+
+    if referer.is_empty() { None } else { Some(referer) }
+}
+
+/// Span of a request, adding the site, the user doing the request, where its ip is and where it
+/// comes from to the default fields
 #[derive(Clone, Debug)]
-pub struct RequestSpan;
+pub struct RequestSpan(Arc<GeoIp>);
+
+impl RequestSpan {
+    pub fn new(geoip: Arc<GeoIp>) -> Self {
+        Self(geoip)
+    }
+}
 
 impl<B> MakeSpan<B> for RequestSpan {
     fn make_span(&mut self, request: &Request<B>) -> Span {
         let site = request_hostname(request).map(site_name_of).unwrap_or_default();
         let user = downstream_user_of(request).unwrap_or("-");
+        // X-Forwarded-For is free-form text, so it is logged as-is but only looked up when it parses
+        let ip = user.parse::<IpAddr>().ok();
+        let info = ip.map(|ip| self.0.lookup(ip)).unwrap_or_default();
+        let referer = referer_of(request).unwrap_or("-");
 
         span!(
             Level::INFO,
@@ -138,8 +159,17 @@ impl<B> MakeSpan<B> for RequestSpan {
             method = %request.method(),
             uri = %request.uri(),
             version = ?request.version(),
-            site = %site,
-            user = %user,
+            // Debug rather than Display for every free-form value: it quotes and escapes them, so a
+            // space in a city or an org name does not end the field halfway through for a logfmt parser
+            site = ?site,
+            user = ?user,
+            country = ?info.country.unwrap_or("-"),
+            city = ?info.city.unwrap_or("-"),
+            // AS0 is reserved and never routed, so it reads as "unknown" the way "-" does for the others
+            asn = %info.asn.unwrap_or(0),
+            org = ?info.org.unwrap_or("-"),
+            // last, as it is the only field with no bound on its length
+            referer = ?referer,
         )
     }
 }
@@ -175,6 +205,24 @@ mod tests {
         );
         assert_eq!(downstream_user_of(&request(Some(""))), None);
         assert_eq!(downstream_user_of(&request(None)), None);
+    }
+
+    #[test]
+    fn test_referer_of() {
+        let request = |referer: Option<&str>| {
+            let mut request = Request::builder().uri("/");
+            if let Some(referer) = referer {
+                request = request.header(header::REFERER, referer);
+            }
+            request.body(()).unwrap()
+        };
+
+        assert_eq!(
+            referer_of(&request(Some("https://news.ycombinator.com/item?id=1"))),
+            Some("https://news.ycombinator.com/item?id=1")
+        );
+        assert_eq!(referer_of(&request(Some(""))), None);
+        assert_eq!(referer_of(&request(None)), None);
     }
 
     #[test]

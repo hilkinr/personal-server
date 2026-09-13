@@ -1,3 +1,4 @@
+use crate::geoip::GeoIp;
 use crate::sites::Sites;
 use anyhow::Context;
 use axum::Router;
@@ -16,6 +17,7 @@ use tracing::level_filters::LevelFilter;
 use tracing::{Level, info};
 use tracing_subscriber::EnvFilter;
 
+mod geoip;
 mod sites;
 
 #[global_allocator]
@@ -39,6 +41,16 @@ struct Cli {
     /// Directory containing one sub-directory per hostname to serve
     #[arg(long, default_value = "public", env = "ROOT_DIR")]
     root_dir: PathBuf,
+
+    /// MaxMind-format database giving the country and city of an ip, i.e dbip-city-lite.
+    /// Without it, both fields are logged as unknown.
+    #[arg(long, env = "GEOIP_CITY_DB")]
+    geoip_city_db: Option<PathBuf>,
+
+    /// MaxMind-format database giving the AS number and owner of an ip, i.e dbip-asn-lite.
+    /// Without it, both fields are logged as unknown.
+    #[arg(long, env = "GEOIP_ASN_DB")]
+    geoip_asn_db: Option<PathBuf>,
 }
 
 fn cli_init<T: clap::Parser>() -> T {
@@ -70,12 +82,15 @@ async fn main() -> Result<(), anyhow::Error> {
         info!("Serving http://{}.* from {:?}", host, dir);
     }
 
+    let geoip = GeoIp::load(cli.geoip_city_db.as_deref(), cli.geoip_asn_db.as_deref())
+        .with_context(|| "Cannot load the geoip databases")?;
+
     let listener = TcpListener::bind(&cli.http_listen)
         .await
         .with_context(|| format!("Cannot bind http server on {}", cli.http_listen))?;
 
     info!("Starting http server on {}", cli.http_listen);
-    axum::serve(listener, get_router(sites))
+    axum::serve(listener, get_router(sites, geoip))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .with_context(|| "Http server failure")?;
@@ -83,7 +98,7 @@ async fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn get_router(sites: Sites) -> Router {
+fn get_router(sites: Sites, geoip: GeoIp) -> Router {
     // TraceLayer logs at debug level by default, so raise the response event to info
     let static_files = Router::new()
         .fallback(sites::serve_static_file)
@@ -92,7 +107,7 @@ fn get_router(sites: Sites) -> Router {
             ServiceBuilder::new()
                 .layer(
                     TraceLayer::new_for_http()
-                        .make_span_with(sites::RequestSpan)
+                        .make_span_with(sites::RequestSpan::new(Arc::new(geoip)))
                         .on_response(DefaultOnResponse::new().level(Level::INFO)),
                 )
                 .layer(CompressionLayer::new()),
@@ -123,7 +138,7 @@ mod tests {
 
     fn router() -> Router {
         let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("public");
-        get_router(Sites::load(&root_dir).unwrap())
+        get_router(Sites::load(&root_dir).unwrap(), GeoIp::load(None, None).unwrap())
     }
 
     async fn get(host: &str, path: &str) -> StatusCode {

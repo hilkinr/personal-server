@@ -365,7 +365,7 @@ kustomization deletes it from the cluster** on the next apply. Run
 | `nextcloud` | cloud.erebe.eu | toybox | two PVCs: nvme + hdd |
 | `vaultwarden` | bitwarden.erebe.eu | toybox | |
 | `karakeep` | keep.erebe.eu | toybox | own namespace; web + meilisearch + chrome |
-| `blog` | **wstunnel.erebe.eu/.dev** | toybox | **Rust/axum static file server**, `services/blog/`. One site per subdir of `public/`, selected by the hostname's first label (`src/sites.rs`); `public/` holds only `wstunnel/` |
+| `blog` | **wstunnel.erebe.eu/.dev** | toybox | **Rust/axum static file server**, `services/blog/`. One site per subdir of `public/`, selected by the hostname's first label (`src/sites.rs`); `public/` holds only `wstunnel/`. Request logs carry the client's country/city/ASN, looked up in the DB-IP lite databases baked into the image — `DBIP_MONTH` in its Dockerfile is pinned and bumped by hand |
 | `blog-back` | blog.erebe.eu/.dev — **not routed** | — | Retired Zola blog, **no justfile recipe**. See the warning below |
 | `coub` | coub.erebe.eu | toybox | |
 | `dashy` | board.erebe.eu | toybox (bespoke tolerations) | dashboard |
