@@ -1,0 +1,132 @@
+---
+- name: Configure scw node
+  hosts: scw
+  become: true
+  vars:
+    node_dir: "{{ inventory_dir }}/scw"
+    network_unit: wan.network
+    # zdata is the only pool on this host, a 1.66T mirror that had never been
+    # scrubbed. Weekly rather than the monthly timer because nothing else reads
+    # these disks end to end, and a mirror only repairs the rot it notices.
+    zfs_scrub_pools: [zdata]
+    # scw_dns_name / scw_ipv4 / scw_ipv6 come from group_vars/all.yml: public
+    # addresses are never hardcoded, they are resolved from the scw.erebe.eu
+    # A / AAAA records on the control node.
+
+  tasks:
+    - name: Base packages
+      tags: [package, never]
+      ansible.builtin.import_tasks: ../common/tasks/package.yml
+
+    - name: ZFS module and tools
+      tags: [zfs, never]
+      ansible.builtin.import_tasks: ../common/tasks/zfs.yml
+
+    - name: ZFS datasets and properties
+      tags: [zfs, never]
+      vars:
+        # Only what is set locally on the host today, so the first run is a
+        # no-op. See the header of the imported file, and the longer notes in
+        # proxmox/playbook.yml, for why the pool itself is not declared and why
+        # 'off'/'on' have to stay quoted.
+        zfs_datasets:
+          - name: zdata
+            properties:
+              # local-hostpath-values.yaml provisions under /mnt/zdata; the pool
+              # would otherwise mount at /zdata.
+              mountpoint: /mnt/zdata
+              atime: 'off'
+              # Already the ZFS default, but set locally on the pool - listed
+              # so the declaration matches the host and the first run is green.
+              xattr: 'sa'
+              compression: 'lz4'
+              dnodesize: auto
+              recordsize: 128K
+      ansible.builtin.import_tasks: ../common/tasks/zfs-datasets.yml
+
+    # Snapshots, and the login proxmox pulls them with - the shared task does
+    # both, keyed on this play's ansible_user (erebe here).
+    - name: Sanoid snapshots
+      tags: [sanoid, never]
+      ansible.builtin.import_tasks: ../common/tasks/sanoid.yml
+
+    - name: networkd config
+      tags: [network, never]
+      ansible.builtin.import_tasks: ../common/tasks/networkd.yml
+
+    - name: Migrate from ifupdown to systemd-networkd + systemd-resolved
+      tags: [migrate-networkd, never]
+      block:
+        - name: Enable and start systemd-networkd
+          ansible.builtin.systemd:
+            name: systemd-networkd.service
+            enabled: true
+            state: started
+
+        - name: Enable and start systemd-resolved
+          ansible.builtin.systemd:
+            name: systemd-resolved.service
+            enabled: true
+            state: started
+
+        - name: Point /etc/resolv.conf at systemd-resolved stub
+          ansible.builtin.file:
+            src: /run/systemd/resolve/stub-resolv.conf
+            dest: /etc/resolv.conf
+            state: link
+            force: true
+
+        - name: Reboot reminder
+          ansible.builtin.debug:
+            msg: >
+              ifupdown disabled; networkd + resolved are running.
+              Reboot the host so eth0 comes up under networkd exclusively.
+
+    - name: Firewall (nftables)
+      tags: [firewall, never]
+      block:
+        - name: Upload nftables.rules to /etc/nftables.conf
+          ansible.builtin.copy:
+            src: "{{ node_dir }}/config/nftables.rules"
+            dest: /etc/nftables.conf
+            owner: root
+            group: root
+            mode: '0755'
+          notify: reload nftables
+
+        - name: Enable nftables service
+          ansible.builtin.systemd:
+            name: nftables.service
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    - name: Wireguard
+      tags: [wireguard, never]
+      ansible.builtin.import_tasks: ../common/tasks/wireguard.yml
+
+    - name: Resolve scw public addresses from its DNS records
+      tags: [k3s-agent, never]
+      ansible.builtin.assert:
+        that:
+          - scw_ipv4 is match('^\d+\.\d+\.\d+\.\d+$')
+          - scw_ipv6 is search(':')
+        fail_msg: >-
+          Could not resolve A/AAAA for {{ scw_dns_name }} (got v4='{{ scw_ipv4 }}'
+          v6='{{ scw_ipv6 }}'). Publish the zone with `just dns` first.
+        success_msg: "{{ scw_dns_name }} -> {{ scw_ipv4 }} / {{ scw_ipv6 }}"
+
+    - name: K3s agent install
+      tags: [k3s-agent, never]
+      ansible.builtin.import_tasks: ../common/tasks/k3s-agent.yml
+
+  handlers:
+    - name: reload nftables
+      ansible.builtin.systemd:
+        name: nftables.service
+        state: reloaded
+
+    - name: restart sshd
+      ansible.builtin.systemd:
+        name: sshd.service
+        state: restarted

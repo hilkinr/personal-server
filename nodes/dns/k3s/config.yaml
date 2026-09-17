@@ -1,4 +1,4 @@
-node-name: "raspberry"
+node-name: "dns"
 node-ip: "fd00:cafe::2,10.200.0.2"
 #node-external-ip: "2001:861:3886:7e01:88ef:70ff:fe5a:1359"
 

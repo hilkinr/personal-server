@@ -1,0 +1,408 @@
+# Alloy - the node agent: container logs to Loki, host metrics to Prometheus.
+#
+# This is the one component that is NOT a single instance, and it cannot be: it
+# tails container log files off each node's own filesystem and reads that node's
+# own /proc and /sys, so a single pod would only ever see one machine. A
+# DaemonSet is one pod per node by design - that is coverage, not high
+# availability, and there is no leader election or replication involved.
+#
+# The host metrics half replaces the stack's prometheus-node-exporter
+# DaemonSet - `prometheus.exporter.unix` below *is* node_exporter, vendored into
+# the Alloy binary - so there is one agent per node instead of two. See
+# `nodeExporter.enabled` in kube-prometheus-stack-values.yaml.
+controller:
+  type: daemonset
+  # Every node, whatever it is tainted with - including scw. Without this the
+  # tainted nodes silently ship no logs.
+  tolerations:
+    - operator: Exists
+
+  # node_exporter's netdev collector reads <procfs>/net/dev, and /proc/net is a
+  # symlink to self/net - which resolves in the *reading process's* network
+  # namespace, whatever /proc it is read through. In a pod netns that yields the
+  # pod's own eth0 and lo, so every node_network_receive_bytes_total in the
+  # cluster would be measuring this DaemonSet's own traffic. Verified against
+  # grafana/alloy:v1.19.2: 2 devices without hostNetwork, all 8 host interfaces
+  # with it.
+  #
+  # This is the same reason prometheus-node-exporter sets hostNetwork: true, and
+  # it lands Alloy's HTTP server on the node's :12345 exactly as node-exporter
+  # held :9100 - the pod-to-host rules in nodes/{scw,server}/config/nftables.rules
+  # already cover it.
+  #
+  # Note that only netdev is affected: netclass (node_network_up, mtu, ...) comes
+  # from sysfs and reports the host's interfaces either way, which is the trap -
+  # half the network metrics would have looked right.
+  hostNetwork: true
+  # hostNetwork pods get the node's resolver by default, and loki.write needs
+  # cluster DNS to resolve loki.observability.svc.cluster.local.
+  dnsPolicy: ClusterFirstWithHostNet
+
+  volumes:
+    extra:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: root
+        hostPath:
+          path: /
+      # dns is a Raspberry Pi: journald stays volatile there on purpose, to keep
+      # the SD card from wearing out, so its journal is only under
+      # /run/log/journal. DirectoryOrCreate so the four nodes that flushed their
+      # runtime journal mount an empty dir instead of failing - a journal
+      # component whose path does not exist logs
+      # "sd_journal_open_directory failed: no such file or directory".
+      - name: runlog
+        hostPath:
+          path: /run/log/journal
+          type: DirectoryOrCreate
+
+      # --storage.path, which the chart otherwise leaves on the container's own
+      # layer: every restart then loses loki.source.file's positions.yml and
+      # re-reads every container log file from the start, which Loki answers
+      # with 400 'entry too far behind' for anything older than an hour.
+      #
+      # /run and not /var/lib: it is tmpfs on every node, and dns is the
+      # Raspberry Pi whose journal is already kept off the SD card - positions
+      # are rewritten every 10s and would be the same wear pattern. The whole
+      # state is 800K (756K of it the remote_write WAL). The cost is that a node
+      # *reboot* still replays once, unlike a pod restart.
+      - name: alloydata
+        hostPath:
+          path: /run/alloy
+          type: DirectoryOrCreate
+
+# Alloy exposes its own metrics on :12345. With the operator's CRDs in place
+# that is a ServiceMonitor rather than a scrape annotation.
+serviceMonitor:
+  enabled: true
+
+alloy:
+  # Matches the alloydata hostPath below; the chart's default is /tmp/alloy.
+  storagePath: /run/alloy
+
+  # Clustering exists to shard scrape targets between Alloy peers. Each pod here
+  # only ever reads its own node's files, so there is nothing to shard.
+  clustering:
+    enabled: false
+
+  enableReporting: false
+
+  mounts:
+    # /var/log/pods/... - where the containerd CRI writes container logs.
+    varlog: true
+
+    # The host filesystem that node_exporter reads, at the paths its own chart
+    # uses (--path.procfs / --path.sysfs / --path.rootfs), so the collectors and
+    # the mount-point excludes below behave identically.
+    #
+    # No hostPID, unlike prometheus-node-exporter: the mount table comes from
+    # /host/proc/1/mounts by path, and a bind mount of the host's /proc is the
+    # host's procfs instance whatever PID namespace the reader is in, so PID 1
+    # there is already the host's init.
+    extra:
+      - name: proc
+        mountPath: /host/proc
+        readOnly: true
+      - name: sys
+        mountPath: /host/sys
+        readOnly: true
+      - name: runlog
+        mountPath: /run/log/journal
+        readOnly: true
+      # Writable, unlike every other mount here.
+      - name: alloydata
+        mountPath: /run/alloy
+      - name: root
+        mountPath: /host/root
+        readOnly: true
+        # Or the container keeps the mount table it started with and filesystem
+        # metrics go stale for anything mounted afterwards - every PVC, for one.
+        mountPropagation: HostToContainer
+
+  # Those log files are root-owned with no world read bit.
+  securityContext:
+    runAsUser: 0
+
+  extraEnv:
+    # HOSTNAME inside the pod is the *pod* name, so the node name has to come
+    # from the downward API for the discovery field selector to match anything.
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+    # Both only exist to be relabelled onto the host metrics - see the
+    # discovery.relabel block.
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: POD_NAMESPACE
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.namespace
+
+  # Up from 128Mi: node_exporter's ~1600 series per node and the remote_write
+  # WAL are new here. node-exporter's own chart requested nothing at all, so
+  # this is the whole of what replacing it costs.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      memory: 512Mi
+
+  configMap:
+    content: |-
+      logging {
+        level  = "warn"
+        format = "logfmt"
+      }
+
+      // Only the pods scheduled on this node. Discovering the whole cluster
+      // would hand every DaemonSet pod the same target list, and each would
+      // then look for log files that live on some other machine.
+      discovery.kubernetes "pods" {
+        role = "pod"
+
+        selectors {
+          role  = "pod"
+          field = "spec.nodeName=" + sys.env("NODE_NAME")
+        }
+      }
+
+      discovery.relabel "pod_logs" {
+        targets = discovery.kubernetes.pods.targets
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          target_label  = "namespace"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_name"]
+          target_label  = "pod"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_container_name"]
+          target_label  = "container"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_node_name"]
+          target_label  = "node"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_container_name"]
+          separator     = "/"
+          target_label  = "job"
+        }
+
+        // Log files live at
+        //   /var/log/pods/<namespace>_<pod>_<uid>/<container>/<n>.log
+        // The concatenated source labels give "<uid>/<container>", and the
+        // leading glob stands in for the namespace_pod_ prefix so we do not
+        // have to reconstruct it.
+        rule {
+          source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+          separator     = "/"
+          action        = "replace"
+          replacement   = "/var/log/pods/*$1/*.log"
+          target_label  = "__path__"
+        }
+      }
+
+      local.file_match "pod_logs" {
+        path_targets = discovery.relabel.pod_logs.output
+      }
+
+      loki.source.file "pod_logs" {
+        targets    = local.file_match.pod_logs.targets
+        forward_to = [loki.process.pod_logs.receiver]
+      }
+
+      loki.process "pod_logs" {
+        // containerd writes CRI-format lines:
+        //   <timestamp> <stream> <F|P> <message>
+        // This lifts the real timestamp, splits out stdout/stderr and
+        // reassembles partial lines, leaving only the message as the log body.
+        stage.cri {}
+
+        forward_to = [loki.write.default.receiver]
+      }
+
+      loki.write "default" {
+        endpoint {
+          url = "http://loki.observability.svc.cluster.local:3100/loki/api/v1/push"
+        }
+      }
+
+      // ---- host journal ------------------------------------------------------
+      //
+      // job and node come from relabel rules, not from the component's own
+      // `labels` argument - that argument is ignored here and entries come out
+      // labelled job="loki.source.journal.host" (checked against v1.19.2).
+      // Same trap as prometheus.scrape's job_name below.
+      discovery.relabel "journal" {
+        targets = []
+
+        rule {
+          target_label = "job"
+          replacement  = "systemd-journal"
+        }
+
+        rule {
+          target_label = "node"
+          replacement  = sys.env("NODE_NAME")
+        }
+
+        rule {
+          source_labels = ["__journal__systemd_unit"]
+          target_label  = "unit"
+        }
+
+        rule {
+          source_labels = ["__journal_priority_keyword"]
+          target_label  = "level"
+        }
+
+        rule {
+          source_labels = ["__journal__transport"]
+          target_label  = "transport"
+        }
+
+        // dmesg: kernel messages reach journald over _TRANSPORT=kernel and
+        // carry no unit, so without this they are only findable by their empty
+        // unit label. A non-matching regex leaves `unit` alone.
+        rule {
+          source_labels = ["__journal__transport"]
+          regex         = "kernel"
+          replacement   = "kernel"
+          target_label  = "unit"
+        }
+      }
+
+      // Only those five become labels. The other __journal_* fields are
+      // per-message (PID, command line, message id) and would multiply streams;
+      // they stay in the line.
+      // One component per journal location, and `path` always explicit. Leaving
+      // it unset to let the reader use journald's own defaults does not work:
+      // max_age is then ignored and the pod replays the entire journal, which
+      // Loki answers with
+      //   400 'entry too far behind, entry timestamp is: ...'
+      // dropping the lot on every restart. With a path it seeks correctly.
+      //
+      // A node has one or the other: persistent under /var/log/journal
+      // everywhere except dns, volatile under /run/log/journal on dns. The
+      // component that finds an empty directory just yields nothing.
+      loki.source.journal "persistent" {
+        path = "/var/log/journal"
+
+        // Only matters when there is no saved cursor - see the alloydata
+        // hostPath - so this is the backfill after a node reboot.
+        max_age = "1h"
+
+        relabel_rules = discovery.relabel.journal.rules
+        forward_to    = [loki.write.default.receiver]
+      }
+
+      loki.source.journal "volatile" {
+        path          = "/run/log/journal"
+        max_age       = "1h"
+        relabel_rules = discovery.relabel.journal.rules
+        forward_to    = [loki.write.default.receiver]
+      }
+
+      // ---- host metrics ------------------------------------------------------
+      //
+      // This is node_exporter, vendored into the Alloy binary: same collectors,
+      // same metric names, same default set. The paths and the two excludes are
+      // exactly what prometheus-node-exporter passed on its command line, so
+      // node_filesystem_* covers the same mounts it did before.
+      prometheus.exporter.unix "node" {
+        procfs_path    = "/host/proc"
+        sysfs_path     = "/host/sys"
+        rootfs_path    = "/host/root"
+        udev_data_path = "/host/root/run/udev/data"
+
+        filesystem {
+          mount_points_exclude = "^/(dev|proc|sys|run/containerd/.+|var/lib/docker/.+|var/lib/kubelet/.+)($|/)"
+          fs_types_exclude     = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs|erofs)$"
+        }
+      }
+
+      // Every label here is load-bearing, because the exporter's own targets
+      // carry none of what the kubernetes-mixin rules and the 1860/nodes/
+      // node-rsrc-use dashboards select on:
+      //
+      //  - job: the exporter presets job = "integrations/unix", and
+      //    prometheus.scrape's job_name only fills the label in when it is
+      //    *unset*, so job_name is silently ignored and this rule is the only
+      //    thing that works. Every mixin rule and dashboard matches
+      //    job="node-exporter".
+      //  - instance: the exported target's address is Alloy's in-memory
+      //    address, identical on every node, so without this all five nodes
+      //    would collapse into one instance="alloy.internal:12345" series and
+      //    fight over it. The node name is what kube-prometheus's own jsonnet
+      //    relabels instance to; it also survives pod restarts, which the
+      //    <node-ip>:9100 it used to be did not.
+      //  - namespace / pod: node.rules joins node_cpu_seconds_total to
+      //    kube_pod_info on (namespace, pod) to recover the node - that is how
+      //    node:node_num_cpu:sum gets its node label. They describe the agent
+      //    pod, not the host, exactly as they did when the ServiceMonitor
+      //    attached them to node-exporter.
+      discovery.relabel "node_exporter" {
+        targets = prometheus.exporter.unix.node.targets
+
+        rule {
+          target_label = "job"
+          replacement  = "node-exporter"
+        }
+
+        rule {
+          target_label = "instance"
+          replacement  = sys.env("NODE_NAME")
+        }
+
+        rule {
+          target_label = "namespace"
+          replacement  = sys.env("POD_NAMESPACE")
+        }
+
+        rule {
+          target_label = "pod"
+          replacement  = sys.env("POD_NAME")
+        }
+      }
+
+      // In-process: the target resolves to Alloy's in-memory address, so this
+      // never touches a socket. The interval matches
+      // prometheusSpec.scrapeInterval - Alloy's own default is 60s, which would
+      // have quietly coarsened every host metric by 6x.
+      prometheus.scrape "node_exporter" {
+        targets         = discovery.relabel.node_exporter.output
+        scrape_interval = "10s"
+        forward_to      = [prometheus.remote_write.default.receiver]
+      }
+
+      // Push, because Prometheus cannot pull this: the exporter's metrics are
+      // only served on Alloy's /api/v0/component/... API, which is a debug
+      // surface and not something to hang the host metrics off. Needs
+      // prometheusSpec.enableRemoteWriteReceiver, which the stack's values set.
+      //
+      // prometheus.scrape still synthesises up{job="node-exporter"} and the
+      // scrape_* series and pushes them along, so a collector that starts
+      // failing is still visible. What is gone is the operator's own view of the
+      // target: if the pod is down there is nothing left to report up == 0, and
+      // TargetDown then fires for job="alloy" instead - which is the ServiceMonitor
+      // above, scraped by Prometheus, and down for the same reason.
+      prometheus.remote_write "default" {
+        endpoint {
+          url = "http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090/api/v1/write"
+        }
+      }
