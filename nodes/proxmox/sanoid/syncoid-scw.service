@@ -1,0 +1,30 @@
+[Unit]
+Description=Syncoid replication scw:zdata -> backup/scw-backup
+Documentation=man:syncoid(8)
+Requires=zfs.target
+After=zfs.target
+# The source is across the tunnel, and Persistent=true fires a missed run at
+# boot - before wg0 is up.
+Wants=network-online.target
+After=network-online.target wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+# Type=oneshot has no start timeout by default, so a stalled ssh would stay
+# "activating" forever and every later timer trigger would be skipped.
+TimeoutStartSec=6h
+# mbuffer warns on every run without HOME.
+Environment=HOME=/root
+# --no-sync-snap: replicate only what sanoid took, so the source login needs no
+#   snapshot or destroy rights.
+# erebe@, not root@: scw has PermitRootLogin no. syncoid prefixes `sudo` itself
+#   for a non-root remote user, which is why no zfs delegation exists - the cost
+#   is that this key is admin-equivalent on scw.
+# accept-new: the path is wg0, where nothing can present itself as 10.200.1.2
+#   without scw's key.
+ExecStart=/usr/sbin/syncoid --recursive --no-sync-snap \
+  --sshkey=/etc/syncoid/id_scw \
+  --sshoption=StrictHostKeyChecking=accept-new \
+  --sshoption=UserKnownHostsFile=/etc/syncoid/known_hosts \
+  --sshoption=ConnectTimeout=15 \
+  erebe@10.200.1.2:zdata backup/scw-backup
