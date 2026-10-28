@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wstunnel
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {}
+  template:
+    metadata: {}
+    spec:
+      #hostNetwork: true
+      #dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: wstunnel
+        image: ghcr.io/erebe/wstunnel:latest
+        imagePullPolicy: Always
+        args:
+        - "./wstunnel"
+        - "server"
+        - "wss://[::]:8084"
+        - "--enable-webtransport"
+        - "--dns-resolver=dns://[fd00:cafe::2]"
+        - "--restrict-config=/etc/wstunnel/restrictions.yaml"
+        ports:
+        - containerPort: 8084
+          protocol: TCP
+        - containerPort: 8084
+          protocol: UDP
+        volumeMounts:
+          - name: wstunnel
+            mountPath: /etc/wstunnel
+            readOnly: true
+      volumes:
+      - name: wstunnel
+        secret:
+          secretName: wstunnel
